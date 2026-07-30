@@ -61,7 +61,12 @@ $script:UiReady       = $false
 
 $script:AppName    = "RCM"
 $script:AppLongName = "Robot Code Manager"
-$script:AppVersion = "1.0"
+# Must match the tag of the release this build ships as: the update check
+# compares this against the latest tag on GitHub. Build-Exe.ps1 prints it and
+# warns when it has fallen behind the newest local tag.
+$script:AppVersion = "1.0.2"
+$script:UpdateApiUrl = "https://api.github.com/repos/willfreyman/RobotCodeManager/releases/latest"
+$script:ReleasesUrl  = "https://github.com/willfreyman/RobotCodeManager/releases/latest"
 $script:AppTeam    = "Nightbots  -  FRC 10686"
 $script:AppAuthor  = "416aab - Will Freyman"
 
@@ -272,6 +277,7 @@ function Load-Settings {
         offlineDeploy = $true    # matches wpilib.deployOffline default
         skipTests     = $false   # matches wpilib.skipTests default
         taskCounts    = [PSCustomObject]@{}   # per project+task Gradle task counts
+        checkUpdatesOnStart = $true           # silent background version check
         recentProjects = @()     # projects used before, newest first
         searchRoots    = @()     # folders known to contain robot projects
     }
@@ -290,7 +296,8 @@ function Load-Settings {
 
     try {
         $loaded = Get-Content -Path $sourcePath -Raw -ErrorAction Stop | ConvertFrom-Json
-        foreach ($name in @('lastProject', 'offlineBuild', 'offlineDeploy', 'skipTests', 'taskCounts')) {
+        foreach ($name in @('lastProject', 'offlineBuild', 'offlineDeploy', 'skipTests',
+                            'taskCounts', 'checkUpdatesOnStart')) {
             if ($null -ne $loaded.$name) { $defaults.$name = $loaded.$name }
         }
         # A single-element JSON array can come back as a bare string.
@@ -1462,6 +1469,222 @@ function Check-RobotConnection {
         Set-Busy $false
         Update-StateDisplay $script:RepoState
     }
+}
+
+# ---------------- Update check ----------------
+#
+# Asks GitHub for the newest release and compares it with $script:AppVersion.
+# The request is fired off and then polled from a timer rather than waited on:
+# at a competition there is usually no internet, and a launcher that stalls for
+# ten seconds on startup because of a version check is worse than a stale one.
+
+$script:UpdateTask    = $null
+$script:UpdateClient  = $null
+$script:UpdateClock   = $null
+$script:UpdateManual  = $false
+$script:UpdateLatest  = $null   # tag of a newer release, once one is known
+
+function ConvertTo-ComparableVersion {
+    param([string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
+
+    # Accepts "v1.2.3", "1.2.3", "V1.2". Anything after the numbers (a "-beta"
+    # suffix, say) is ignored rather than treated as an error.
+    if ($Text -notmatch '(\d+(?:\.\d+)*)') { return $null }
+    $numbers = $Matches[1]
+    if ($numbers -notmatch '\.') { $numbers = "$numbers.0" }
+    try { return [version]$numbers } catch { return $null }
+}
+
+function Start-UpdateCheck {
+    param([switch]$Manual)
+
+    if ($null -ne $script:UpdateTask) {
+        # One already in flight; let it finish rather than stacking requests.
+        if ($Manual) { $script:UpdateManual = $true }
+        return
+    }
+
+    $script:UpdateManual = [bool]$Manual
+    try {
+        # Windows PowerShell 5.1 still defaults to older protocols, and GitHub
+        # refuses anything below TLS 1.2.
+        [System.Net.ServicePointManager]::SecurityProtocol =
+            [System.Net.SecurityProtocolType]::Tls12
+
+        # HttpWebRequest.GetResponseAsync rather than WebClient's task helpers:
+        # WebClient posts completion back to the captured SynchronizationContext,
+        # so the task only finishes while a message loop is running. This one
+        # completes on a thread-pool thread and can simply be polled.
+        $request = [System.Net.HttpWebRequest]::Create([uri]$script:UpdateApiUrl)
+        $request.Method = "GET"
+        # GitHub rejects API requests that do not identify themselves.
+        $request.UserAgent = "RCM/$($script:AppVersion)"
+        $request.Accept = "application/vnd.github+json"
+
+        $script:UpdateClient = $request
+        $script:UpdateClock = [System.Diagnostics.Stopwatch]::StartNew()
+        $script:UpdateTask = $request.GetResponseAsync()
+        $updateTimer.Start()
+        Append-Log "Checking for a newer version of RCM...`r`n"
+    }
+    catch {
+        Reset-UpdateCheck
+        Append-Log "Update check could not start: $($_.Exception.Message)`r`n"
+        if ($Manual) { Show-Error "Could not check for updates: $($_.Exception.Message)" }
+    }
+}
+
+function Reset-UpdateCheck {
+    $updateTimer.Stop()
+    if ($null -ne $script:UpdateClient) {
+        try { $script:UpdateClient.Abort() } catch { }
+    }
+    $script:UpdateClient = $null
+    $script:UpdateTask = $null
+    $script:UpdateClock = $null
+}
+
+function Complete-UpdateCheck {
+    if ($null -eq $script:UpdateTask) { $updateTimer.Stop(); return }
+
+    if (-not $script:UpdateTask.IsCompleted) {
+        if ($script:UpdateClock.Elapsed.TotalSeconds -gt 12) {
+            $manual = $script:UpdateManual
+            Reset-UpdateCheck
+            Append-Log "Update check timed out (no internet?).`r`n"
+            if ($manual) {
+                Show-Info ("Could not reach GitHub to check for updates.`r`n`r`n" +
+                           "This is normal on a robot network or at a venue with no internet.")
+            }
+        }
+        return
+    }
+
+    $manual = $script:UpdateManual
+    $task = $script:UpdateTask
+
+    if ($task.IsFaulted -or $task.IsCanceled) {
+        $reason = if ($task.Exception) { $task.Exception.GetBaseException().Message } else { "cancelled" }
+        Reset-UpdateCheck
+        Append-Log "Update check failed: $reason`r`n"
+        if ($manual) {
+            Show-Info ("Could not reach GitHub to check for updates.`r`n`r`n$reason`r`n`r`n" +
+                       "This is normal on a robot network or at a venue with no internet.")
+        }
+        return
+    }
+
+    # Small payload, already on the wire: reading it now costs nothing.
+    $payload = $null
+    try {
+        $response = $task.Result
+        $stream = $response.GetResponseStream()
+        $reader = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::UTF8)
+        $payload = $reader.ReadToEnd()
+        $reader.Close()
+        $response.Close()
+    }
+    catch {
+        Reset-UpdateCheck
+        Append-Log "Update check: could not read the reply ($($_.Exception.Message)).`r`n"
+        if ($manual) { Show-Info "GitHub's reply could not be read, so the version could not be checked." }
+        return
+    }
+    Reset-UpdateCheck
+
+    try {
+        $release = $payload | ConvertFrom-Json
+    }
+    catch {
+        Append-Log "Update check: could not read GitHub's reply.`r`n"
+        if ($manual) { Show-Info "GitHub's reply could not be read, so the version could not be checked." }
+        return
+    }
+
+    $tag = [string]$release.tag_name
+    $remote = ConvertTo-ComparableVersion $tag
+    $local = ConvertTo-ComparableVersion $script:AppVersion
+
+    if (($null -eq $remote) -or ($null -eq $local)) {
+        Append-Log "Update check: version '$tag' could not be compared with '$($script:AppVersion)'.`r`n"
+        if ($manual) { Show-Info "The latest version on GitHub is '$tag'. This copy is v$($script:AppVersion)." }
+        return
+    }
+
+    if ($remote -gt $local) {
+        $script:UpdateLatest = $tag
+        Append-Log "A newer version is available: $tag (this copy is v$($script:AppVersion)).`r`n"
+        Set-UpdateAvailable -Tag $tag
+        # Only interrupt when the user asked. On startup the button is enough.
+        if ($manual) { Show-UpdateDialog -Release $release }
+    }
+    else {
+        Append-Log "RCM is up to date (v$($script:AppVersion)).`r`n"
+        if ($manual) {
+            Show-Info "RCM is up to date.`r`n`r`nThis copy is v$($script:AppVersion), and $tag is the newest release."
+        }
+    }
+}
+
+function Show-UpdateDialog {
+    param($Release)
+
+    $tag = [string]$Release.tag_name
+    $name = [string]$Release.name
+    $published = ""
+    if ($Release.published_at) {
+        try { $published = ([datetime]$Release.published_at).ToString("d MMMM yyyy") } catch { }
+    }
+
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.Add("A newer version of RCM is available.")
+    $lines.Add("")
+    $lines.Add("You have : v$($script:AppVersion)")
+    $lines.Add("Newest   : $tag$(if ($name -and $name -ne $tag) { "  ($name)" })")
+    if ($published) { $lines.Add("Released : $published") }
+    $lines.Add("")
+
+    $notes = [string]$Release.body
+    if (-not [string]::IsNullOrWhiteSpace($notes)) {
+        $trimmed = @($notes -split "`r?`n" | Where-Object { $_.Trim() -ne "" } | Select-Object -First 6)
+        $lines.Add("What changed:")
+        foreach ($line in $trimmed) {
+            $clean = ($line -replace '[*_`#]', '').Trim()
+            if ($clean) { $lines.Add("  " + $clean.Substring(0, [Math]::Min(90, $clean.Length))) }
+        }
+        $lines.Add("")
+    }
+
+    $lines.Add("Open the download page in your browser?")
+    $lines.Add("Download RCM.exe and replace this one. Your settings are kept.")
+
+    if (Show-WarningConfirm ($lines -join "`r`n") "Update available") {
+        try {
+            Start-Process $script:ReleasesUrl
+            Append-Log "Opened the releases page in your browser.`r`n"
+        }
+        catch {
+            Show-Error "Could not open the browser. Go to:`r`n$($script:ReleasesUrl)"
+        }
+    }
+}
+
+function Set-UpdateAvailable {
+    param([string]$Tag)
+    if ($null -eq $btnUpdate) { return }
+    $btnUpdate.Text = "Update to $Tag"
+    $btnUpdate.Width = 150
+    Set-AccentButton $btnUpdate $script:ColGo
+}
+
+function Invoke-UpdateButton {
+    if ($script:UpdateLatest) {
+        # Already know one is waiting: re-query so the notes shown are current.
+        Start-UpdateCheck -Manual
+        return
+    }
+    Start-UpdateCheck -Manual
 }
 
 # ---------------- Gradle ----------------
@@ -2695,6 +2918,7 @@ $btnProject  = New-ActionButton "Change Project" 112
 $btnVSCode   = New-ActionButton "Open VS Code" 106
 $btnFolder   = New-ActionButton "Open Folder" 96
 $btnStopG    = New-ActionButton "Stop Gradle" 92
+$btnUpdate   = New-ActionButton "Check Updates" 108
 
 Set-AccentButton $btnDeploy $script:ColGo
 Set-AccentButton $btnBuild  $script:ColBuild
@@ -2703,7 +2927,12 @@ $btnCancel.Enabled = $false
 
 # Cancel is deliberately excluded: it must stay usable while an operation runs.
 $actionButtons = @($btnRefresh, $btnBuild, $btnDeploy, $btnRobot, $btnCommit, $btnBranch, $btnPull,
-                   $btnPush, $btnDiff, $btnProject, $btnVSCode, $btnFolder, $btnStopG)
+                   $btnPush, $btnDiff, $btnProject, $btnVSCode, $btnFolder, $btnStopG, $btnUpdate)
+
+# Polls the in-flight update request. Started only while a check is running.
+$updateTimer = New-Object System.Windows.Forms.Timer
+$updateTimer.Interval = 250
+$updateTimer.Add_Tick({ Complete-UpdateCheck })
 
 $optionPanel = New-Object System.Windows.Forms.Panel
 $optionPanel.Dock = "Top"
@@ -3118,6 +3347,7 @@ $btnRobot.Add_Click({ Check-RobotConnection })
 $btnProject.Add_Click({ Change-Project })
 $btnVSCode.Add_Click({ Open-VSCode })
 $btnStopG.Add_Click({ Stop-GradleDaemons })
+$btnUpdate.Add_Click({ Invoke-UpdateButton })
 
 $btnCancel.Add_Click({
     if ($null -eq $script:CurrentProcess) { return }
@@ -3153,9 +3383,15 @@ $form.Add_FormClosing({
 })
 
 $form.Add_FormClosed({
-    if ($null -ne $activityTimer) {
-        $activityTimer.Stop()
-        $activityTimer.Dispose()
+    foreach ($timer in @($activityTimer, $updateTimer)) {
+        if ($null -ne $timer) {
+            $timer.Stop()
+            $timer.Dispose()
+        }
+    }
+    # A request still in flight would otherwise keep the process alive.
+    if ($null -ne $script:UpdateClient) {
+        try { $script:UpdateClient.Abort() } catch { }
     }
 })
 
@@ -3198,6 +3434,12 @@ $form.Add_Shown({
     Resolve-JdkPath | Out-Null
     Update-CommandPreview
     Refresh-Repository -Fetch
+
+    # Last, and silent: the window is already usable, and with no internet this
+    # simply times out in the background without anyone noticing.
+    if ($script:Settings.checkUpdatesOnStart -ne $false) {
+        Start-UpdateCheck
+    }
 })
 
 [void]$form.ShowDialog()

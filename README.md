@@ -92,6 +92,22 @@ anything.
 Offline deploy is on by default, matching WPILib's own default, which is what you
 want at a competition with no internet.
 
+## Staying up to date
+
+RCM checks GitHub for a newer release when it starts. The check runs in the
+background and is silent unless there is something newer, so a laptop with no
+internet - a robot network, or a venue with nothing but the field - is never held
+up by it.
+
+When a newer version exists, the **Check Updates** button turns green and reads
+*Update to vX.Y.Z*. Click it for the release notes and a link to the download.
+Updating means replacing `RCM.exe`; settings, remembered projects and calibrated
+build times all live outside the .exe and are kept.
+
+Click **Check Updates** any time to check on demand; unlike the startup check it
+reports the result either way. To turn the startup check off, set
+`"checkUpdatesOnStart": false` in `%LOCALAPPDATA%\RCM\settings.json`.
+
 ## Guardrails
 
 - Deploy confirms first, listing branch, commit, uncommitted-file count, whether

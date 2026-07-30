@@ -112,6 +112,28 @@ if ($parseErrors -and $parseErrors.Count -gt 0) {
 }
 Write-Host "Script parsed cleanly." -ForegroundColor Green
 
+# The in-app update check compares $script:AppVersion against the newest tag on
+# GitHub, so a build whose version has fallen behind the tags would tell users
+# they need an update they already have.
+$declared = $null
+if ((Get-Content -LiteralPath $scriptSource -Raw) -match '\$script:AppVersion\s*=\s*"([^"]+)"') {
+    $declared = $Matches[1]
+    Write-Host "Version: v$declared"
+}
+try {
+    $newestTag = (& git -C $scriptDir tag --list "v*" --sort=-v:refname 2>$null | Select-Object -First 1)
+    if ($declared -and $newestTag) {
+        $tagVersion = [version]($newestTag -replace '^v', '')
+        if ([version]$declared -lt $tagVersion) {
+            Write-Host ("  WARNING: AppVersion v$declared is older than the newest tag $newestTag. " +
+                        "Bump it before releasing.") -ForegroundColor Yellow
+        }
+    }
+}
+catch {
+    # Not a git checkout, or an odd tag: not worth failing a build over.
+}
+
 $csc = Join-Path $env:WINDIR "Microsoft.NET\Framework64\v4.0.30319\csc.exe"
 if (-not (Test-Path -LiteralPath $csc)) {
     $csc = Join-Path $env:WINDIR "Microsoft.NET\Framework\v4.0.30319\csc.exe"
