@@ -1,0 +1,5 @@
+# Build output. The .exe ships as a release asset, not in the repository.
+*.exe
+
+# Local deploy records written into a robot project.
+.deploy-history/
