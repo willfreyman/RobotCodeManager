@@ -64,7 +64,7 @@ $script:AppLongName = "Robot Code Manager"
 # Must match the tag of the release this build ships as: the update check
 # compares this against the latest tag on GitHub. Build-Exe.ps1 prints it and
 # warns when it has fallen behind the newest local tag.
-$script:AppVersion = "1.0.2"
+$script:AppVersion = "1.0.3"
 $script:UpdateApiUrl = "https://api.github.com/repos/willfreyman/RobotCodeManager/releases/latest"
 $script:ReleasesUrl  = "https://github.com/willfreyman/RobotCodeManager/releases/latest"
 $script:AppTeam    = "Nightbots  -  FRC 10686"
@@ -653,7 +653,7 @@ function Set-ActiveProject {
     }
     if ($null -ne $form) {
         $leaf = Split-Path -Leaf $script:ProjectRoot
-        $form.Text = "RCM - $leaf"
+        $form.Text = "RCM v$($script:AppVersion) - $leaf"
     }
 }
 
@@ -2734,7 +2734,7 @@ function Open-VSCode {
 # ---------------- UI ----------------
 
 $form = New-Object System.Windows.Forms.Form
-$form.Text = "RCM"
+$form.Text = "RCM v$($script:AppVersion)"
 $form.StartPosition = "CenterScreen"
 $form.Size = New-Object System.Drawing.Size(1180, 860)
 $form.MinimumSize = New-Object System.Drawing.Size(1000, 700)
