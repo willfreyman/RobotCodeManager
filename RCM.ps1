@@ -1099,7 +1099,9 @@ function Get-RepositoryState {
     $headFull = if ($hasCommits) { (Invoke-Git @("rev-parse", "HEAD") -AllowFailure -Quiet).StdOut.Trim() } else { "" }
 
     $statusLines = @()
-    $statusResult = Invoke-Git @("status", "--porcelain=v1") -AllowFailure -Quiet
+    # core.quotePath=false stops git escaping non-ASCII paths as "caf\303\251.txt",
+    # which would never resolve back to a real file on disk.
+    $statusResult = Invoke-Git @("-c", "core.quotePath=false", "status", "--porcelain=v1") -AllowFailure -Quiet
     if ($statusResult.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($statusResult.StdOut)) {
         $statusLines = @($statusResult.StdOut -split "`r?`n" | Where-Object { $_ -ne "" })
     }
@@ -1736,20 +1738,24 @@ function Get-FailureHint {
 
     $text = ($Result.StdOut + "`n" + $Result.StdErr)
 
-    if ($text -match 'Are you sure the target is correct|No target found|Missing Target|cannot be reached|Could not resolve.*roborio') {
-        if (-not $Robot) {
-            return ("The robot was not reachable before this deploy started. " +
-                    "Check power, the radio, and your network connection, then use Check Robot.")
-        }
-        return "GradleRIO could not reach the roboRIO even though it answered a ping. Try again, or reboot the roboRIO."
-    }
-    if ($text -match 'Could not resolve all (files|dependencies)|Could not GET|Connection (refused|timed out)|UnknownHostException') {
+    # Dependency failures are tested first on purpose. Gradle words them as
+    # "Could not resolve all files for configuration ':roborio'", which reads
+    # like a robot problem but is really a download problem, and sending someone
+    # to check the radio when the fix is --offline wastes time on the field.
+    if ($text -match 'Could not resolve all (files|dependencies)|Could not GET|Connection (refused|timed out)|UnknownHostException|Could not download') {
         if ($Task -eq 'deploy') {
             return ("Gradle tried to download dependencies and failed. Tick 'Offline deploy' " +
                     "so it uses the local WPILib maven cache instead.")
         }
         return ("Gradle tried to download dependencies and failed. Tick 'Offline build' to use " +
                 "the local WPILib maven cache, or connect this computer to the internet.")
+    }
+    if ($text -match 'Are you sure the target is correct|No target found|Missing Target|cannot be reached|Unable to determine.*address|No route to host') {
+        if (-not $Robot) {
+            return ("The robot was not reachable before this deploy started. " +
+                    "Check power, the radio, and your network connection, then use Check Robot.")
+        }
+        return "GradleRIO could not reach the roboRIO even though it answered a ping. Try again, or reboot the roboRIO."
     }
     if ($text -match 'invalid source release|release version .* not supported|UnsupportedClassVersionError|Unsupported class file major version') {
         $year = if ($script:ProjectYear) { $script:ProjectYear } else { "this season" }
@@ -2190,7 +2196,8 @@ function Get-ChangedFileList {
 
     # git status collapses an untracked folder to a single "docs/" entry, which is
     # a directory and has no content to show. ls-files names the actual files.
-    $othersRaw = (Invoke-Git @("ls-files", "--others", "--exclude-standard") -AllowFailure -Quiet).StdOut
+    $othersRaw = (Invoke-Git @("-c", "core.quotePath=false", "ls-files", "--others",
+                               "--exclude-standard") -AllowFailure -Quiet).StdOut
     if (-not [string]::IsNullOrWhiteSpace($othersRaw)) {
         $others = @($othersRaw -split "`r?`n" | Where-Object { $_ -ne "" })
         $limit = 50
@@ -2308,6 +2315,8 @@ function Render-Diff {
     if ($tracked.Count -gt 0) {
         # Compare against HEAD so changes already staged in VS Code still appear.
         $gitArgs = New-Object System.Collections.Generic.List[string]
+        $gitArgs.Add("-c")
+        $gitArgs.Add("core.quotePath=false")
         $gitArgs.Add("diff")
         $gitArgs.Add("--no-color")
         if ($state.HasCommits) { $gitArgs.Add("HEAD") }
