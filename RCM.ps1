@@ -64,7 +64,7 @@ $script:AppLongName = "Robot Code Manager"
 # Must match the tag of the release this build ships as: the update check
 # compares this against the latest tag on GitHub. Build-Exe.ps1 prints it and
 # warns when it has fallen behind the newest local tag.
-$script:AppVersion = "1.0.3"
+$script:AppVersion = "1.0.4"
 $script:UpdateApiUrl = "https://api.github.com/repos/willfreyman/RobotCodeManager/releases/latest"
 $script:ReleasesUrl  = "https://github.com/willfreyman/RobotCodeManager/releases/latest"
 $script:AppTeam    = "Nightbots  -  FRC 10686"
@@ -172,6 +172,21 @@ function Append-Log {
     $txtOutput.AppendText($Text)
     $txtOutput.SelectionStart = $txtOutput.TextLength
     $txtOutput.ScrollToCaret()
+}
+
+function Write-Utf8File {
+    param([string]$Path, [string[]]$Lines, [switch]$Append)
+    # Written without a byte-order mark. PowerShell 5.1's -Encoding UTF8 emits
+    # one, which lands at the very start of the file and makes the first line
+    # of deployments.jsonl unparseable by any standard JSON reader - exactly the
+    # thing an audit trail has to survive.
+    $text = ($Lines -join "`r`n") + "`r`n"
+    $encoding = New-Object System.Text.UTF8Encoding($false)
+    if ($Append) {
+        [System.IO.File]::AppendAllText($Path, $text, $encoding)
+    } else {
+        [System.IO.File]::WriteAllText($Path, $text, $encoding)
+    }
 }
 
 function Show-Error {
@@ -316,7 +331,7 @@ function Save-Settings {
     try {
         $dir = Split-Path -Parent $script:SettingsPath
         if (-not (Test-Path $dir)) { New-Item -Path $dir -ItemType Directory -Force | Out-Null }
-        $script:Settings | ConvertTo-Json | Set-Content -Path $script:SettingsPath -Encoding UTF8
+        Write-Utf8File -Path $script:SettingsPath -Lines @($script:Settings | ConvertTo-Json)
     }
     catch {
         Append-Log "Could not save settings: $($_.Exception.Message)`r`n"
@@ -1802,7 +1817,7 @@ function Write-RunLog {
             "----- errors -----",
             $Result.StdErr
         )
-        Set-Content -Path $path -Value $content -Encoding UTF8
+        Write-Utf8File -Path $path -Lines $content
         return $path
     }
     catch {
@@ -1837,7 +1852,7 @@ function Write-DeploymentRecord {
             logFile        = $LogPath
         }
         $jsonLine = $record | ConvertTo-Json -Compress -Depth 5
-        Add-Content -Path (Join-Path (Get-LogDirectory) "deployments.jsonl") -Value $jsonLine -Encoding UTF8
+        Write-Utf8File -Path (Join-Path (Get-LogDirectory) "deployments.jsonl") -Lines @($jsonLine) -Append
     }
     catch {
         Append-Log "Could not write the deployment record: $($_.Exception.Message)`r`n"
