@@ -108,6 +108,39 @@ Click **Check Updates** any time to check on demand; unlike the startup check it
 reports the result either way. To turn the startup check off, set
 `"checkUpdatesOnStart": false` in `%LOCALAPPDATA%\RCM\settings.json`.
 
+## Commits
+
+**Commit & Push** is one button because it is one job: save the work, and get it
+off this laptop. It asks for a message, and the same dialog carries a *Push to
+GitHub when the commit is made* tick box. If there is nothing to commit but there
+are commits that never reached GitHub, it offers to push those instead.
+
+When the push cannot happen the tick box is disabled and says why - no upstream
+branch, or GitHub has newer commits and you need to **Pull Safely** first. A
+commit is never held back because the push is impossible: the work gets saved
+either way, and the message says clearly if it is still only on this computer.
+
+The **Commits** tab lists local history with a *State* column reading `pushed`,
+`not pushed`, or `local only`. Unpushed rows are orange. There is no separate
+"Not Pushed" tab any more - those were the same commits listed twice.
+
+**Double-click any commit** to open it. That gives you:
+
+- the changes in that commit, the changes since it, the files as they were at
+  that point, and the full message
+- whether it is on this branch, and whether it has been pushed
+- **Undo Just This Commit** - a new commit reversing that one
+- **Roll Back To Here** - a new commit putting every file back as it was then
+
+Both undo actions work by *adding* a commit, never by deleting one, so the
+original history stays in the log and the undo can itself be undone. They are
+disabled while the tree is dirty, on merge commits, and on commits that are not
+in this branch. If the undo cannot be applied cleanly it is backed out entirely
+and the project is left untouched.
+
+Undoing changes the code on this computer only. The robot keeps running the last
+thing you deployed until you deploy again.
+
 ## Guardrails
 
 - Deploy confirms first, listing branch, commit, uncommitted-file count, whether

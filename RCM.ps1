@@ -64,7 +64,7 @@ $script:AppLongName = "Robot Code Manager"
 # Must match the tag of the release this build ships as: the update check
 # compares this against the latest tag on GitHub. Build-Exe.ps1 prints it and
 # warns when it has fallen behind the newest local tag.
-$script:AppVersion = "1.0.4"
+$script:AppVersion = "1.1.0"
 $script:UpdateApiUrl = "https://api.github.com/repos/willfreyman/RobotCodeManager/releases/latest"
 $script:ReleasesUrl  = "https://github.com/willfreyman/RobotCodeManager/releases/latest"
 $script:AppTeam    = "Nightbots  -  FRC 10686"
@@ -1094,7 +1094,7 @@ function New-EmptyRepoState {
         Head = "-"; HeadFull = ""; Dirty = $false; ChangedCount = 0
         StatusLines = @(); ConflictCount = 0
         HasUpstream = $false; Upstream = "(none)"; Ahead = 0; Behind = 0
-        LocalCommits = ""; IncomingCommits = ""; OutgoingCommits = ""
+        LocalCommits = ""; IncomingCommits = ""; UnpushedShas = @()
         MergeInProgress = $false; RebaseInProgress = $false
     }
 }
@@ -1144,25 +1144,34 @@ function Get-RepositoryState {
         }
     }
 
+    # The full hash leads, so a row can be identified exactly rather than by the
+    # abbreviation git happens to print. The subject stays last because it is the
+    # only field that can itself contain a tab.
+    $logFormat = "--pretty=format:%H`t%h`t%ad`t%an`t%s"
+
     $localCommits = ""
     if ($hasCommits) {
         $localCommits = (Invoke-Git @(
-            "log", "--max-count=15", "--pretty=format:%h`t%ad`t%an`t%s", "--date=short", "HEAD"
+            "log", "--max-count=15", $logFormat, "--date=short", "HEAD"
         ) -AllowFailure -Quiet).StdOut
     }
 
     $incoming = ""
     if ($hasUpstream -and $behind -gt 0) {
         $incoming = (Invoke-Git @(
-            "log", "--max-count=15", "--pretty=format:%h`t%ad`t%an`t%s", "--date=short", "HEAD..@{upstream}"
+            "log", "--max-count=15", $logFormat, "--date=short", "HEAD..@{upstream}"
         ) -AllowFailure -Quiet).StdOut
     }
 
-    $outgoing = ""
+    # Which of the local commits have not reached the remote yet. This replaces
+    # the separate "Not Pushed" list: those commits are the same objects already
+    # shown under Commits, so they are marked in place instead of listed twice.
+    $unpushed = @()
     if ($hasUpstream -and $ahead -gt 0) {
-        $outgoing = (Invoke-Git @(
-            "log", "--max-count=15", "--pretty=format:%h`t%ad`t%an`t%s", "--date=short", "@{upstream}..HEAD"
-        ) -AllowFailure -Quiet).StdOut
+        $revs = Invoke-Git @("rev-list", "@{upstream}..HEAD") -AllowFailure -Quiet
+        if ($revs.ExitCode -eq 0) {
+            $unpushed = @($revs.StdOut -split "`r?`n" | Where-Object { $_ -ne "" })
+        }
     }
 
     return [PSCustomObject]@{
@@ -1183,7 +1192,7 @@ function Get-RepositoryState {
         Behind = $behind
         LocalCommits = $localCommits
         IncomingCommits = $incoming
-        OutgoingCommits = $outgoing
+        UnpushedShas = $unpushed
         MergeInProgress = (Test-GitPath "MERGE_HEAD")
         RebaseInProgress = (Test-GitPath "rebase-merge") -or (Test-GitPath "rebase-apply")
     }
@@ -1227,7 +1236,17 @@ function Set-Busy {
 }
 
 function Add-CommitRows {
-    param([System.Windows.Forms.ListView]$ListView, [string]$Text)
+    param(
+        [System.Windows.Forms.ListView]$ListView,
+        [string]$Text,
+        # Full hashes not yet on the remote. Only meaningful for the local list.
+        [string[]]$Unpushed = @(),
+        # $false when the branch has no upstream: nothing has been pushed, but
+        # calling every commit "not pushed" would be misleading rather than true.
+        [bool]$HasUpstream = $true,
+        [switch]$ShowState
+    )
+
     $ListView.BeginUpdate()
     try {
         $ListView.Items.Clear()
@@ -1235,13 +1254,38 @@ function Add-CommitRows {
             [void]$ListView.Items.Add((New-Object System.Windows.Forms.ListViewItem("(none)")))
             return
         }
+
+        $unpushedSet = @{}
+        foreach ($sha in $Unpushed) { $unpushedSet[$sha] = $true }
+
         foreach ($line in ($Text -split "`r?`n")) {
-            $parts = $line -split "`t", 4
-            if ($parts.Count -lt 4) { continue }
-            $item = New-Object System.Windows.Forms.ListViewItem($parts[0])
-            [void]$item.SubItems.Add($parts[1])
+            # full`tshort`tdate`tauthor`tsubject - subject last, so a tab inside
+            # it cannot shift the other fields.
+            $parts = $line -split "`t", 5
+            if ($parts.Count -lt 5) { continue }
+
+            $item = New-Object System.Windows.Forms.ListViewItem($parts[1])
+            # The exact commit, kept off screen. Everything that acts on a row
+            # reads this rather than the abbreviation shown in column 0.
+            $item.Tag = $parts[0]
             [void]$item.SubItems.Add($parts[2])
             [void]$item.SubItems.Add($parts[3])
+
+            if ($ShowState) {
+                $state = if (-not $HasUpstream) {
+                    "local only"
+                } elseif ($unpushedSet.ContainsKey($parts[0])) {
+                    "not pushed"
+                } else {
+                    "pushed"
+                }
+                [void]$item.SubItems.Add($state)
+                if ($state -ne "pushed") {
+                    $item.ForeColor = [System.Drawing.Color]::DarkOrange
+                }
+            }
+
+            [void]$item.SubItems.Add($parts[4])
             [void]$ListView.Items.Add($item)
         }
     }
@@ -1311,23 +1355,23 @@ function Update-StateDisplay {
         "(no changed files)"
     }
 
-    Add-CommitRows -ListView $listRecent -Text $State.LocalCommits
+    Add-CommitRows -ListView $listRecent -Text $State.LocalCommits -ShowState `
+                   -Unpushed $State.UnpushedShas -HasUpstream $State.HasUpstream
     Add-CommitRows -ListView $listIncoming -Text $State.IncomingCommits
-    Add-CommitRows -ListView $listOutgoing -Text $State.OutgoingCommits
 
     $free = -not $script:IsBusy
     $gitOk = $free -and $State.IsRepo
 
-    $btnCommit.Enabled = $gitOk -and $State.Dirty -and ($State.ConflictCount -eq 0) -and
+    # Enabled when there is either something to commit or something to push:
+    # the one button covers both halves of the job.
+    $btnCommit.Enabled = $gitOk -and ($State.Dirty -or ($State.Ahead -gt 0)) -and
+                         ($State.ConflictCount -eq 0) -and
                          (-not $State.MergeInProgress) -and (-not $State.RebaseInProgress)
 
     $btnPull.Enabled = $gitOk -and $State.HasUpstream -and (-not $State.Dirty) -and
                        ($State.Behind -gt 0) -and ($State.Ahead -eq 0) -and
                        ($State.ConflictCount -eq 0) -and (-not $State.MergeInProgress) -and
                        (-not $State.RebaseInProgress)
-
-    $btnPush.Enabled = $gitOk -and $State.HasUpstream -and ($State.Ahead -gt 0) -and
-                       ($State.Behind -eq 0) -and ($State.ConflictCount -eq 0)
 
     $btnDiff.Enabled = $gitOk
 
@@ -2043,48 +2087,204 @@ function Stop-GradleDaemons {
 
 # ---------------- Git actions ----------------
 
-function Commit-All {
-    Refresh-Repository
-    $state = $script:RepoState
-    if ($null -eq $state -or -not $state.IsRepo) {
-        Show-Error "This project is not in a Git repository, so there is nothing to commit."
-        return
+function Show-CommitMessageDialog {
+    # Like Show-InputDialog, but with the "and push it" decision attached to the
+    # message, because that is one decision in the user's head: "save my work and
+    # get it off this laptop". Returns @{ Message; Push } or $null.
+    param(
+        [string]$Prompt,
+        [bool]$CanPush,
+        [string]$PushLabel,
+        [string]$BlockedReason
+    )
+
+    $dialog = New-Object System.Windows.Forms.Form
+    $dialog.Text = "Commit and push"
+    $dialog.StartPosition = "CenterParent"
+    $dialog.FormBorderStyle = "FixedDialog"
+    $dialog.MaximizeBox = $false
+    $dialog.MinimizeBox = $false
+    $dialog.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $dialog.ClientSize = New-Object System.Drawing.Size(520, 268)
+    Set-DialogIcon $dialog
+
+    $label = New-Object System.Windows.Forms.Label
+    $label.Text = $Prompt
+    $label.Location = New-Object System.Drawing.Point(14, 12)
+    $label.Size = New-Object System.Drawing.Size(492, 62)
+    $dialog.Controls.Add($label)
+
+    $box = New-Object System.Windows.Forms.TextBox
+    $box.Location = New-Object System.Drawing.Point(14, 78)
+    $box.Multiline = $true
+    $box.ScrollBars = "Vertical"
+    $box.Size = New-Object System.Drawing.Size(492, 100)
+    $box.AcceptsReturn = $true
+    $dialog.Controls.Add($box)
+
+    $chkPush = New-Object System.Windows.Forms.CheckBox
+    $chkPush.Text = $PushLabel
+    $chkPush.Location = New-Object System.Drawing.Point(16, 188)
+    $chkPush.Size = New-Object System.Drawing.Size(492, 22)
+    $chkPush.Checked = $CanPush
+    $chkPush.Enabled = $CanPush
+    $dialog.Controls.Add($chkPush)
+
+    if (-not $CanPush) {
+        $why = New-Object System.Windows.Forms.Label
+        $why.Text = $BlockedReason
+        $why.ForeColor = [System.Drawing.Color]::DarkRed
+        $why.Location = New-Object System.Drawing.Point(34, 210)
+        $why.Size = New-Object System.Drawing.Size(472, 18)
+        $dialog.Controls.Add($why)
     }
-    if (-not $state.Dirty) {
-        Show-Info "There are no changes to commit."
+
+    $ok = New-Object System.Windows.Forms.Button
+    $ok.Text = "Commit"
+    $ok.DialogResult = [System.Windows.Forms.DialogResult]::OK
+    $ok.Size = New-Object System.Drawing.Size(96, 28)
+    $ok.Location = New-Object System.Drawing.Point(316, 232)
+    $dialog.Controls.Add($ok)
+
+    $cancel = New-Object System.Windows.Forms.Button
+    $cancel.Text = "Cancel"
+    $cancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $cancel.Size = New-Object System.Drawing.Size(96, 28)
+    $cancel.Location = New-Object System.Drawing.Point(418, 232)
+    $dialog.Controls.Add($cancel)
+
+    # The message box needs Enter for new lines, so it cannot be the accept key.
+    $dialog.CancelButton = $cancel
+    $chkPush.Add_CheckedChanged({ $ok.Text = if ($chkPush.Checked) { "Commit && Push" } else { "Commit" } })
+    $ok.Text = if ($chkPush.Checked) { "Commit && Push" } else { "Commit" }
+
+    try {
+        if ($dialog.ShowDialog($form) -ne [System.Windows.Forms.DialogResult]::OK) { return $null }
+        return @{ Message = $box.Text; Push = $chkPush.Checked }
+    }
+    finally {
+        $dialog.Dispose()
+    }
+}
+
+function Commit-AndPush {
+    # One button for the whole "save my work and back it up" job. Committing and
+    # pushing were two buttons with two sets of preconditions, and the common
+    # case was always both, in that order.
+    Refresh-Repository -Fetch
+    $state = $script:RepoState
+    if ($null -eq $state) { return }
+
+    if (-not $state.IsRepo) {
+        Show-Error "This project is not in a Git repository, so there is nothing to commit or push."
         return
     }
     if ($state.ConflictCount -gt 0 -or $state.MergeInProgress -or $state.RebaseInProgress) {
         Show-Error "Resolve the conflicts or finish the merge/rebase before committing from here."
         return
     }
-    if (-not (Ensure-GitIdentity)) {
-        Append-Log "`r`nCommit cancelled: no Git identity was set.`r`n"
+
+    if ((-not $state.Dirty) -and ($state.Ahead -eq 0)) {
+        Show-Info "Everything is already committed and pushed. There is nothing to do."
         return
     }
 
-    $preview = ($state.StatusLines | Select-Object -First 12) -join "`r`n"
-    if ($state.ChangedCount -gt 12) { $preview += "`r`n... and $($state.ChangedCount - 12) more" }
-
-    $message = Show-InputDialog -Multiline -Title "Commit all changes" -Prompt (
-        "Describe what changed. All $($state.ChangedCount) file(s) below will be committed:`r`n$preview")
-    if ([string]::IsNullOrWhiteSpace($message)) {
-        Append-Log "`r`nCommit cancelled.`r`n"
-        return
+    # Push is only safe as a fast-forward. Behind means the remote moved, and
+    # pushing would be rejected anyway; say so before the work, not after.
+    $canPush = $state.HasUpstream -and ($state.Behind -eq 0)
+    $blockedReason = if (-not $state.HasUpstream) {
+        "This branch has no upstream branch, so there is nowhere to push it."
+    } elseif ($state.Behind -gt 0) {
+        "GitHub has $($state.Behind) newer commit(s). Use Pull Safely first, then push."
+    } else {
+        ""
     }
 
-    Set-Busy $true "Committing..."
-    try {
-        $add = Invoke-Git @("add", "--all") -AllowFailure
-        if ($add.ExitCode -ne 0) {
-            Show-Error "git add failed. Read the output for details."
+    $wantPush = $false
+
+    if ($state.Dirty) {
+        if (-not (Ensure-GitIdentity)) {
+            Append-Log "`r`nCommit cancelled: no Git identity was set.`r`n"
             return
         }
-        $commit = Invoke-Git @("commit", "-m", $message.Trim()) -AllowFailure
-        if ($commit.ExitCode -ne 0) {
-            Show-Error "git commit failed. Read the output for details."
+
+        $preview = ($state.StatusLines | Select-Object -First 10) -join "`r`n"
+        if ($state.ChangedCount -gt 10) { $preview += "`r`n... and $($state.ChangedCount - 10) more" }
+
+        $pending = if ($state.Ahead -gt 0) {
+            " Doing so also pushes $($state.Ahead) earlier commit(s) that never left this computer."
         } else {
+            ""
+        }
+
+        $answer = Show-CommitMessageDialog `
+            -Prompt ("Describe what changed. All $($state.ChangedCount) file(s) below will be committed:`r`n$preview") `
+            -CanPush $canPush `
+            -PushLabel "Push to GitHub when the commit is made.$pending" `
+            -BlockedReason $blockedReason
+
+        if ($null -eq $answer -or [string]::IsNullOrWhiteSpace($answer.Message)) {
+            Append-Log "`r`nCommit cancelled.`r`n"
+            Update-StateDisplay $state
+            return
+        }
+        $wantPush = $answer.Push
+
+        Set-Busy $true "Committing..."
+        try {
+            $add = Invoke-Git @("add", "--all") -AllowFailure
+            if ($add.ExitCode -ne 0) {
+                Show-Error "git add failed. Read the output for details."
+                return
+            }
+            $commit = Invoke-Git @("commit", "-m", $answer.Message.Trim()) -AllowFailure
+            if ($commit.ExitCode -ne 0) {
+                Show-Error "git commit failed, so nothing was pushed. Read the output for details."
+                return
+            }
             Append-Log "`r`nCommit created.`r`n"
+        }
+        finally {
+            Set-Busy $false
+            Refresh-Repository
+        }
+    }
+    else {
+        # Nothing to commit, but there is something to push.
+        if (-not $canPush) {
+            Show-Error $blockedReason
+            return
+        }
+        if (-not (Show-WarningConfirm (
+                "Push $($state.Ahead) commit(s) to $($state.Upstream)?`r`n`r`n" +
+                "Nothing needs committing - these are commits made earlier that have not " +
+                "reached GitHub yet.") "Push commits")) {
+            return
+        }
+        $wantPush = $true
+    }
+
+    if (-not $wantPush) {
+        Append-Log "`r`nCommitted without pushing.`r`n"
+        return
+    }
+
+    # Re-read: the commit above changed Ahead, and a push with nothing to send
+    # would be a confusing no-op.
+    $state = $script:RepoState
+    if ($null -eq $state -or -not $state.HasUpstream -or $state.Ahead -eq 0) { return }
+
+    Set-Busy $true "Pushing commits..."
+    try {
+        $result = Invoke-Git @("push") -AllowFailure -TimeoutSeconds 120
+        if ($result.TimedOut) {
+            Show-Error ("The push timed out, so the work is committed but still only on this " +
+                        "computer. Check the network connection and push again.")
+        } elseif ($result.ExitCode -ne 0) {
+            Show-Error ("The commit was made, but the push failed, so the work is still only on " +
+                        "this computer. Read the output for details.")
+        } else {
+            Append-Log "`r`nPush complete.`r`n"
         }
     }
     finally {
@@ -2121,39 +2321,6 @@ function Safe-Pull {
             Show-Error "Safe pull failed. No automatic merge was performed."
         } else {
             Append-Log "`r`nPull complete.`r`n"
-        }
-    }
-    finally {
-        Set-Busy $false
-        Refresh-Repository
-    }
-}
-
-function Push-Commits {
-    Refresh-Repository -Fetch
-    $s = $script:RepoState
-    if ($null -eq $s) { return }
-    if (-not $s.IsRepo) { Show-Error "This project is not in a Git repository."; return }
-    if (-not $s.HasUpstream) { Show-Error "This branch has no upstream branch. Set one up in VS Code first."; return }
-    if ($s.Behind -gt 0) {
-        Show-Error "Push is blocked because the remote branch has commits you do not have. Pull first."
-        return
-    }
-    if ($s.Ahead -eq 0) { Show-Info "There are no local commits to push."; return }
-
-    if (-not (Show-WarningConfirm "Push $($s.Ahead) local commit(s) to $($s.Upstream)?" "Confirm push")) {
-        return
-    }
-
-    Set-Busy $true "Pushing commits..."
-    try {
-        $result = Invoke-Git @("push") -AllowFailure -TimeoutSeconds 120
-        if ($result.TimedOut) {
-            Show-Error "The push timed out. Check the network connection."
-        } elseif ($result.ExitCode -ne 0) {
-            Show-Error "Git push failed. Read the output for details."
-        } else {
-            Append-Log "`r`nPush complete.`r`n"
         }
     }
     finally {
@@ -2356,7 +2523,7 @@ function Switch-Branch {
                     "uncommitted changes.`r`n`r`n" +
                     "Git would either drag those changes onto the other branch or refuse to " +
                     "switch at all.`r`n`r`n" +
-                    "Use Commit All first (then Push), or undo the changes in VS Code.")
+                    "Use Commit & Push first, or undo the changes in VS Code.")
         return
     }
 
@@ -2692,6 +2859,548 @@ function Show-Changes {
     }
 }
 
+# ---------------- Commit inspector ----------------
+#
+# Double-clicking any row in the three commit lists opens this. It is the one
+# place in the app that can move history, so everything it offers is either
+# read-only or additive: there is no reset, and nothing here can delete a commit
+# or discard a working file. The two undo actions both work by making a NEW
+# commit that reverses an old one, which leaves the original in the log where a
+# student can still find it.
+
+$script:CommitDialogMax = 4000     # lines rendered before the view is cut off
+
+function Get-CommitSha {
+    # Column 0 of every commit row is the short hash, so a selected row already
+    # carries everything needed. The placeholder "(none)" row must not match.
+    param([System.Windows.Forms.ListView]$ListView)
+    if ($null -eq $ListView) { return $null }
+    if ($ListView.SelectedItems.Count -eq 0) { return $null }
+
+    # Tag carries the full hash. Column 0 is only the abbreviation, and the
+    # placeholder "(none)" row has neither.
+    $tag = [string]$ListView.SelectedItems[0].Tag
+    if ($tag -match '^[0-9a-fA-F]{7,40}$') { return $tag }
+
+    $text = $ListView.SelectedItems[0].Text.Trim()
+    if ($text -notmatch '^[0-9a-fA-F]{7,40}$') { return $null }
+    return $text
+}
+
+function Get-CommitInfo {
+    param([string]$Sha)
+
+    # Two calls rather than one: the body is multi-line, so it cannot share a
+    # delimited format string with the single-line fields.
+    $line = (Invoke-Git @("show", "-s", "--format=%H`t%an`t%ad`t%s",
+                          "--date=format:%Y-%m-%d %H:%M", $Sha) -AllowFailure -Quiet)
+    if ($line.ExitCode -ne 0) { return $null }
+
+    $parts = $line.StdOut.Trim() -split "`t", 4
+    if ($parts.Count -lt 4) { return $null }
+
+    $body = (Invoke-Git @("show", "-s", "--format=%B", $Sha) -AllowFailure -Quiet).StdOut
+
+    # rev-list --parents prints "<commit> <parent1> [<parent2> ...]", so anything
+    # past the second field means this is a merge and `git show` will print no
+    # diff for it unless asked.
+    $parents = @()
+    $rev = Invoke-Git @("rev-list", "--parents", "-n", "1", $Sha) -AllowFailure -Quiet
+    if ($rev.ExitCode -eq 0) {
+        $fields = @($rev.StdOut.Trim() -split '\s+')
+        if ($fields.Count -gt 1) { $parents = $fields[1..($fields.Count - 1)] }
+    }
+
+    $head = (Invoke-Git @("rev-parse", "HEAD") -AllowFailure -Quiet).StdOut.Trim()
+
+    # --is-ancestor answers with its exit code and prints nothing.
+    $onBranch = (Invoke-Git @("merge-base", "--is-ancestor", $Sha, "HEAD") `
+                    -AllowFailure -Quiet).ExitCode -eq 0
+
+    $pushed = $false
+    if ($script:RepoState -and $script:RepoState.HasUpstream) {
+        $pushed = (Invoke-Git @("merge-base", "--is-ancestor", $Sha, "@{upstream}") `
+                      -AllowFailure -Quiet).ExitCode -eq 0
+    }
+
+    return [PSCustomObject]@{
+        Sha       = $Sha
+        FullSha   = $parts[0]
+        Author    = $parts[1]
+        Date      = $parts[2]
+        Subject   = $parts[3]
+        Body      = $body.TrimEnd()
+        Parents   = $parents
+        IsMerge   = $parents.Count -gt 1
+        IsHead    = ($head -ne "") -and ($head -eq $parts[0])
+        OnBranch  = $onBranch
+        Pushed    = $pushed
+    }
+}
+
+function Add-ColoredDiff {
+    # Renders unified diff text into any RichTextBox. Render-Diff does the same
+    # job for the main panel, but writes only to $rtbDiff; this one takes the box
+    # as an argument so the dialog can have its own.
+    param(
+        [System.Windows.Forms.RichTextBox]$Box,
+        [string]$Text,
+        [int]$MaxLines = 4000
+    )
+
+    $write = {
+        param([string]$Line, [System.Drawing.Color]$Color, [bool]$Bold)
+        $Box.SelectionStart = $Box.TextLength
+        $Box.SelectionLength = 0
+        $Box.SelectionColor = $Color
+        $style = if ($Bold) {
+            [System.Drawing.FontStyle]::Bold
+        } else {
+            [System.Drawing.FontStyle]::Regular
+        }
+        $Box.SelectionFont = New-Object System.Drawing.Font("Consolas", 9, $style)
+        $Box.AppendText($Line + "`r`n")
+    }
+
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        & $write "(nothing to show)" $script:DiffColorNote $false
+        return
+    }
+
+    $shown = 0
+    foreach ($line in ($Text -split "`r?`n")) {
+        if ($shown -ge $MaxLines) {
+            & $write "" $script:DiffColorCtx $false
+            & $write "... cut off after $MaxLines lines." $script:DiffColorNote $false
+            break
+        }
+
+        if ($line -like 'diff --git *') {
+            if ($shown -gt 0) { & $write "" $script:DiffColorCtx $false; $shown++ }
+            $name = $line -replace '^diff --git a/', '' -replace ' b/.*$', ''
+            & $write $name $script:DiffColorHead $true
+        }
+        elseif ($line -like 'index *' -or $line -like '--- *' -or $line -like '+++ *') {
+            continue
+        }
+        elseif ($line -like '@@*')            { & $write $line $script:DiffColorHunk $false }
+        elseif ($line.StartsWith('+'))        { & $write $line $script:DiffColorAdd  $false }
+        elseif ($line.StartsWith('-'))        { & $write $line $script:DiffColorDel  $false }
+        elseif ($line -like 'Binary files *') { & $write $line $script:DiffColorNote $false }
+        else                                  { & $write $line $script:DiffColorCtx  $false }
+        $shown++
+    }
+
+    $Box.SelectionStart = 0
+    $Box.SelectionLength = 0
+    $Box.ScrollToCaret()
+}
+
+function Get-CommitWarnings {
+    param($Info, $State)
+
+    $warnings = New-Object System.Collections.Generic.List[string]
+
+    if ($Info.IsHead) {
+        $warnings.Add("This is the commit you are on right now.")
+    }
+    if (-not $Info.OnBranch) {
+        $warnings.Add("This commit is not in the current branch's history. It is on another " +
+                      "branch, or came from a fetch. Rolling back to it is not offered.")
+    }
+    if (-not $Info.Pushed) {
+        if ($State.HasUpstream) {
+            $warnings.Add("This commit has not been pushed, so it exists only on this computer.")
+        } else {
+            $warnings.Add("This branch has no upstream, so nothing here is backed up to GitHub.")
+        }
+    }
+    if ($Info.IsMerge) {
+        $warnings.Add("This is a merge commit. Undoing a merge is not something to do from here; " +
+                      "ask a mentor or do it in VS Code.")
+    }
+    if ($State.Dirty) {
+        $warnings.Add("$($State.ChangedCount) file(s) have uncommitted changes, so the undo " +
+                      "actions are disabled. Commit or discard them first.")
+    }
+    if ($State.ConflictCount -gt 0 -or $State.MergeInProgress -or $State.RebaseInProgress) {
+        $warnings.Add("Git has a conflict or an unfinished merge/rebase. Finish that first.")
+    }
+
+    return $warnings
+}
+
+function Invoke-CommitRevert {
+    param(
+        [Parameter(Mandatory=$true)]$Info,
+        # 'single' undoes just this commit; 'rollback' undoes everything after it
+        # as well, putting the files back the way they were at this commit.
+        [Parameter(Mandatory=$true)][ValidateSet('single', 'rollback')][string]$Mode
+    )
+
+    Refresh-Repository
+    $state = $script:RepoState
+    if ($null -eq $state -or -not $state.IsRepo) {
+        Show-Error "This project is not in a Git repository."
+        return $false
+    }
+    if ($state.Dirty) {
+        Show-Error ("There are $($state.ChangedCount) uncommitted change(s).`r`n`r`n" +
+                    "Undo works by making a new commit, and Git will not do that on top of " +
+                    "unsaved work. Commit those changes first, then undo.")
+        return $false
+    }
+    if ($state.ConflictCount -gt 0 -or $state.MergeInProgress -or $state.RebaseInProgress) {
+        Show-Error "Finish or undo the merge/rebase before undoing a commit."
+        return $false
+    }
+    if (-not (Ensure-GitIdentity)) { return $false }
+
+    $summary = if ($Mode -eq 'single') {
+        @("Undo just commit $($Info.Sha)?",
+          "",
+          "  $($Info.Subject)",
+          "",
+          "This makes a NEW commit that reverses that one. Anything committed after it is",
+          "left alone, and the original commit stays in the log.")
+    } else {
+        @("Roll the code back to commit $($Info.Sha)?",
+          "",
+          "  $($Info.Subject)",
+          "",
+          "This makes a NEW commit that puts every file back the way it was at that point.",
+          "Every commit made since then stays in the log and can be recovered.")
+    }
+    $summary += @(
+        "",
+        "Nothing is deleted, and this can itself be undone.",
+        "",
+        "The robot keeps running the last thing you deployed until you deploy again.")
+
+    if (-not (Show-WarningConfirm ($summary -join "`r`n") "Undo commit")) {
+        Append-Log "`r`nUndo cancelled.`r`n"
+        return $false
+    }
+
+    Set-Busy $true "Undoing commit..."
+    try {
+        # --no-commit for both, so the result can be inspected and a conflict can
+        # be backed out cleanly before anything is written to history.
+        $range = if ($Mode -eq 'single') { $Info.Sha } else { "$($Info.Sha)..HEAD" }
+        $revert = Invoke-Git @("revert", "--no-commit", $range) -AllowFailure
+
+        if ($revert.ExitCode -ne 0) {
+            # A conflicting revert leaves the working tree half-applied. Backing
+            # it out is far kinder than leaving a student in that state.
+            Invoke-Git @("revert", "--abort") -AllowFailure -Quiet | Out-Null
+            Invoke-Git @("reset", "--merge") -AllowFailure -Quiet | Out-Null
+            Show-Error ("This undo could not be applied automatically, so nothing was changed.`r`n`r`n" +
+                        "The commit overlaps with later edits to the same lines. Undo it in " +
+                        "VS Code, or ask a mentor.")
+            Append-Log "`r`nUndo failed and was backed out. The project is unchanged.`r`n"
+            return $false
+        }
+
+        $message = if ($Mode -eq 'single') {
+            "Undo commit $($Info.Sha) - $($Info.Subject)"
+        } else {
+            "Roll back to commit $($Info.Sha) - $($Info.Subject)"
+        }
+        $commit = Invoke-Git @("commit", "-m", $message) -AllowFailure
+
+        if ($commit.ExitCode -ne 0) {
+            # Nothing to commit means the revert was a no-op: the tree already
+            # matched. That is a success, not a failure.
+            if ($commit.StdOut -match 'nothing to commit|no changes added') {
+                Invoke-Git @("reset", "--hard", "HEAD") -AllowFailure -Quiet | Out-Null
+                Show-Info "The files already match that commit, so there was nothing to undo."
+                return $false
+            }
+            Show-Error "The undo was prepared but could not be committed. Read the output for details."
+            return $false
+        }
+
+        Append-Log "`r`n$message`r`n"
+        Show-Info ("Done. A new commit was made that $(if ($Mode -eq 'single')
+                    { 'reverses that commit' } else { 'restores the files to that point' }).`r`n`r`n" +
+                   "Nothing was deleted. Push when you are ready, and deploy to put it on the robot.")
+        return $true
+    }
+    catch {
+        Append-Log "`r`nERROR: $($_.Exception.Message)`r`n"
+        Show-Error $_.Exception.Message
+        return $false
+    }
+    finally {
+        Set-Busy $false
+        Refresh-Repository
+    }
+}
+
+function Show-CommitDialog {
+    param([string]$Sha)
+
+    if ($script:IsBusy) { return }
+    if ([string]::IsNullOrWhiteSpace($Sha)) { return }
+
+    $state = $script:RepoState
+    if ($null -eq $state -or -not $state.IsRepo) {
+        Show-Error "This project is not in a Git repository."
+        return
+    }
+
+    Set-Busy $true "Reading commit $Sha..."
+    try { $info = Get-CommitInfo -Sha $Sha } finally { Set-Busy $false }
+
+    if ($null -eq $info) {
+        Show-Error "Commit $Sha could not be read. It may have come from a branch that is no longer fetched."
+        Update-StateDisplay $state
+        return
+    }
+
+    $dialog = New-Object System.Windows.Forms.Form
+    $dialog.Text = "Commit $($info.Sha)"
+    $dialog.StartPosition = "CenterParent"
+    $dialog.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $dialog.ClientSize = New-Object System.Drawing.Size(940, 660)
+    $dialog.MinimumSize = New-Object System.Drawing.Size(720, 480)
+    $dialog.MinimizeBox = $false
+    Set-DialogIcon $dialog
+
+    # --- header -------------------------------------------------------------
+    $header = New-Object System.Windows.Forms.Panel
+    $header.Dock = "Top"
+    $header.Height = 92
+    $header.BackColor = [System.Drawing.Color]::White
+    $dialog.Controls.Add($header)
+
+    $lblSubject = New-Object System.Windows.Forms.Label
+    $lblSubject.Text = $info.Subject
+    $lblSubject.AutoEllipsis = $true
+    $lblSubject.Font = New-Object System.Drawing.Font("Segoe UI Semibold", 11)
+    $lblSubject.ForeColor = $script:ColInk
+    $lblSubject.Location = New-Object System.Drawing.Point(14, 10)
+    $lblSubject.Size = New-Object System.Drawing.Size(900, 24)
+    $header.Controls.Add($lblSubject)
+
+    $place = if ($info.IsHead) {
+        "the commit you are on"
+    } elseif ($info.OnBranch) {
+        "in this branch's history"
+    } else {
+        "not in this branch"
+    }
+    $backup = if ($info.Pushed) { "pushed to $($state.Upstream)" } else { "not pushed" }
+
+    $lblMeta = New-Object System.Windows.Forms.Label
+    $lblMeta.Text = ("$($info.Sha)   -   $($info.Author)   -   $($info.Date)`r`n" +
+                     "$place, $backup")
+    $lblMeta.Font = New-Object System.Drawing.Font("Consolas", 8.5)
+    $lblMeta.ForeColor = $script:ColMuted
+    $lblMeta.Location = New-Object System.Drawing.Point(16, 38)
+    $lblMeta.Size = New-Object System.Drawing.Size(900, 34)
+    $header.Controls.Add($lblMeta)
+
+    # --- warnings -----------------------------------------------------------
+    $warnings = Get-CommitWarnings -Info $info -State $state
+    if ($warnings.Count -gt 0) {
+        $txtWarn = New-Object System.Windows.Forms.TextBox
+        $txtWarn.Dock = "Top"
+        $txtWarn.Multiline = $true
+        $txtWarn.ReadOnly = $true
+        $txtWarn.BorderStyle = "None"
+        $txtWarn.ScrollBars = "Vertical"
+        $txtWarn.Height = [Math]::Min(76, 16 * $warnings.Count + 10)
+        $txtWarn.BackColor = [System.Drawing.Color]::FromArgb(253, 246, 246)
+        $txtWarn.ForeColor = [System.Drawing.Color]::DarkRed
+        $txtWarn.Text = ($warnings | ForEach-Object { "* $_" }) -join "`r`n"
+        $dialog.Controls.Add($txtWarn)
+        $txtWarn.BringToFront()
+    }
+
+    # --- view picker --------------------------------------------------------
+    $viewBar = New-Object System.Windows.Forms.Panel
+    $viewBar.Dock = "Top"
+    $viewBar.Height = 30
+    $viewBar.BackColor = $script:ColBar
+    $dialog.Controls.Add($viewBar)
+    $viewBar.BringToFront()
+
+    $views = @(
+        @{ Key = 'commit';  Text = "Changes in this commit"; Width = 152 }
+        @{ Key = 'since';   Text = "Changes since it";       Width = 116 }
+        @{ Key = 'files';   Text = "Files at this commit";   Width = 136 }
+        @{ Key = 'message'; Text = "Full message";           Width = 100 }
+    )
+
+    $radios = @{}
+    $left = 10
+    foreach ($view in $views) {
+        $radio = New-Object System.Windows.Forms.RadioButton
+        $radio.Text = $view.Text
+        $radio.Tag = $view.Key
+        $radio.AutoSize = $false
+        $radio.Size = New-Object System.Drawing.Size($view.Width, 22)
+        $radio.Location = New-Object System.Drawing.Point($left, 4)
+        $viewBar.Controls.Add($radio)
+        $radios[$view.Key] = $radio
+        $left += $view.Width + 6
+    }
+
+    # --- body ---------------------------------------------------------------
+    $rtb = New-Object System.Windows.Forms.RichTextBox
+    $rtb.Dock = "Fill"
+    $rtb.ReadOnly = $true
+    $rtb.WordWrap = $false
+    $rtb.DetectUrls = $false
+    $rtb.BorderStyle = "None"
+    $rtb.BackColor = [System.Drawing.Color]::White
+    $rtb.Font = New-Object System.Drawing.Font("Consolas", 9)
+    $dialog.Controls.Add($rtb)
+    $rtb.BringToFront()
+
+    # --- buttons ------------------------------------------------------------
+    $footer = New-Object System.Windows.Forms.Panel
+    $footer.Dock = "Bottom"
+    $footer.Height = 44
+    $footer.BackColor = $script:ColBar
+    $dialog.Controls.Add($footer)
+    $footer.BringToFront()
+
+    $btnUndoOne = New-Object System.Windows.Forms.Button
+    $btnUndoOne.Text = "Undo Just This Commit"
+    $btnUndoOne.Size = New-Object System.Drawing.Size(160, 30)
+    $btnUndoOne.Location = New-Object System.Drawing.Point(10, 7)
+    $footer.Controls.Add($btnUndoOne)
+
+    $btnRollback = New-Object System.Windows.Forms.Button
+    $btnRollback.Text = "Roll Back To Here"
+    $btnRollback.Size = New-Object System.Drawing.Size(140, 30)
+    $btnRollback.Location = New-Object System.Drawing.Point(178, 7)
+    $footer.Controls.Add($btnRollback)
+
+    $btnCopySha = New-Object System.Windows.Forms.Button
+    $btnCopySha.Text = "Copy ID"
+    $btnCopySha.Size = New-Object System.Drawing.Size(84, 30)
+    $btnCopySha.Location = New-Object System.Drawing.Point(326, 7)
+    $footer.Controls.Add($btnCopySha)
+
+    $btnClose = New-Object System.Windows.Forms.Button
+    $btnClose.Text = "Close"
+    $btnClose.Size = New-Object System.Drawing.Size(90, 30)
+    $btnClose.Anchor = "Bottom,Right"
+    $btnClose.Location = New-Object System.Drawing.Point(($dialog.ClientSize.Width - 104), 7)
+    $btnClose.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $footer.Controls.Add($btnClose)
+
+    # Undo is offered only where it is both meaningful and safe. A merge commit,
+    # a commit from another branch, or a dirty tree all rule it out, and the
+    # warning panel above already says which one applies.
+    $canUndo = $info.OnBranch -and (-not $info.IsMerge) -and (-not $state.Dirty) -and
+               ($state.ConflictCount -eq 0) -and (-not $state.MergeInProgress) -and
+               (-not $state.RebaseInProgress)
+    $btnUndoOne.Enabled = $canUndo
+    # Rolling back to the commit you are already on would be a no-op.
+    $btnRollback.Enabled = $canUndo -and (-not $info.IsHead)
+
+    # --- behaviour ----------------------------------------------------------
+    $render = {
+        $key = 'commit'
+        foreach ($name in $radios.Keys) {
+            if ($radios[$name].Checked) { $key = [string]$radios[$name].Tag }
+        }
+
+        $rtb.Clear()
+        switch ($key) {
+            'commit' {
+                if ($info.IsMerge) {
+                    Add-ColoredDiff -Box $rtb -MaxLines $script:CommitDialogMax -Text (
+                        "This is a merge commit, so it has no changes of its own to show. " +
+                        "Use 'Changes since it' to see what has happened since.")
+                    return
+                }
+                $text = (Invoke-Git @("show", "--no-color", "--format=", $info.Sha) `
+                            -AllowFailure -Quiet).StdOut
+                Add-ColoredDiff -Box $rtb -Text $text -MaxLines $script:CommitDialogMax
+            }
+            'since' {
+                $text = (Invoke-Git @("diff", "--no-color", $info.Sha, "HEAD") `
+                            -AllowFailure -Quiet).StdOut
+                Add-ColoredDiff -Box $rtb -Text $text -MaxLines $script:CommitDialogMax
+            }
+            'files' {
+                $text = (Invoke-Git @("-c", "core.quotePath=false", "ls-tree", "-r",
+                                      "--name-only", $info.Sha) -AllowFailure -Quiet).StdOut
+                $rtb.SelectionColor = $script:DiffColorCtx
+                if ([string]::IsNullOrWhiteSpace($text)) {
+                    $rtb.AppendText("(no files)`r`n")
+                } else {
+                    $lines = @($text -split "`r?`n")
+                    $rtb.AppendText("$($lines.Count) file(s) in the project at this commit:`r`n`r`n")
+                    $rtb.AppendText(($lines -join "`r`n"))
+                }
+            }
+            'message' {
+                $rtb.SelectionColor = $script:DiffColorHead
+                $rtb.AppendText($info.Subject + "`r`n`r`n")
+                $rtb.SelectionColor = $script:DiffColorCtx
+                $body = if ($info.Body) { $info.Body } else { "(no further description)" }
+                $rtb.AppendText($body + "`r`n`r`n")
+                $rtb.AppendText("Full ID: $($info.FullSha)`r`n")
+                if ($info.Parents.Count -gt 0) {
+                    $rtb.AppendText("Parent : $($info.Parents -join ', ')`r`n")
+                }
+            }
+        }
+        $rtb.SelectionStart = 0
+        $rtb.ScrollToCaret()
+    }
+
+    foreach ($name in $radios.Keys) {
+        $radios[$name].Add_CheckedChanged({ if ($this.Checked) { & $render } })
+    }
+
+    $btnCopySha.Add_Click({
+        try {
+            [System.Windows.Forms.Clipboard]::SetText($info.FullSha)
+            $btnCopySha.Text = "Copied"
+        }
+        catch { }
+    })
+
+    $btnUndoOne.Add_Click({
+        if (Invoke-CommitRevert -Info $info -Mode 'single') {
+            $dialog.DialogResult = [System.Windows.Forms.DialogResult]::OK
+            $dialog.Close()
+        }
+    })
+
+    $btnRollback.Add_Click({
+        if (Invoke-CommitRevert -Info $info -Mode 'rollback') {
+            $dialog.DialogResult = [System.Windows.Forms.DialogResult]::OK
+            $dialog.Close()
+        }
+    })
+
+    $dialog.CancelButton = $btnClose
+
+    try {
+        # Checking the first radio fires CheckedChanged, which draws the view.
+        $radios['commit'].Checked = $true
+        $dialog.ShowDialog($form) | Out-Null
+    }
+    finally {
+        $dialog.Dispose()
+    }
+}
+
+function Show-SelectedCommit {
+    param([System.Windows.Forms.ListView]$ListView)
+    $sha = Get-CommitSha -ListView $ListView
+    if ($null -eq $sha) { return }
+    Show-CommitDialog -Sha $sha
+}
+
 function Change-Project {
     if ($script:IsBusy) { return }
     $candidates = @(Find-AllWpilibProjects)
@@ -2924,10 +3633,9 @@ $btnBuild    = New-ActionButton "Build Robot Code" 128
 $btnDeploy   = New-ActionButton "Deploy Robot Code" 136
 $btnCancel   = New-ActionButton "Cancel" 76
 $btnRobot    = New-ActionButton "Check Robot" 100
-$btnCommit   = New-ActionButton "Commit All" 92
+$btnCommit   = New-ActionButton "Commit & Push" 116
 $btnBranch   = New-ActionButton "Switch Branch" 106
 $btnPull     = New-ActionButton "Pull Safely" 92
-$btnPush     = New-ActionButton "Push Commits" 106
 $btnDiff     = New-ActionButton "View Changes" 106
 $btnProject  = New-ActionButton "Change Project" 112
 $btnVSCode   = New-ActionButton "Open VS Code" 106
@@ -2942,7 +3650,7 @@ $btnCancel.Enabled = $false
 
 # Cancel is deliberately excluded: it must stay usable while an operation runs.
 $actionButtons = @($btnRefresh, $btnBuild, $btnDeploy, $btnRobot, $btnCommit, $btnBranch, $btnPull,
-                   $btnPush, $btnDiff, $btnProject, $btnVSCode, $btnFolder, $btnStopG, $btnUpdate)
+                   $btnDiff, $btnProject, $btnVSCode, $btnFolder, $btnStopG, $btnUpdate)
 
 # Polls the in-flight update request. Started only while a check is running.
 $updateTimer = New-Object System.Windows.Forms.Timer
@@ -3221,6 +3929,8 @@ $commitTabs.Dock = "Fill"
 $diffSplit.Panel2.Controls.Add($commitTabs)
 
 function New-CommitList {
+    param([switch]$WithState)
+
     $list = New-Object System.Windows.Forms.ListView
     $list.Dock = "Fill"
     $list.View = "Details"
@@ -3229,14 +3939,22 @@ function New-CommitList {
     [void]$list.Columns.Add("Commit", 75)
     [void]$list.Columns.Add("Date", 85)
     [void]$list.Columns.Add("Author", 115)
+    if ($WithState) { [void]$list.Columns.Add("State", 78) }
     [void]$list.Columns.Add("Message", 360)
+
+    # Nothing on screen says these rows do anything, so say it here.
+    $tip = New-Object System.Windows.Forms.ToolTip
+    $tip.SetToolTip($list, "Double-click a commit to see what changed in it, and to undo it.")
+
     return $list
 }
 
+# One list for local history. The old "Not Pushed" tab showed the same commits
+# again with nothing to distinguish them, so that state is now a column here.
 $tabRecent = New-Object System.Windows.Forms.TabPage
-$tabRecent.Text = "Recent Local Commits"
+$tabRecent.Text = "Commits"
 $commitTabs.TabPages.Add($tabRecent)
-$listRecent = New-CommitList
+$listRecent = New-CommitList -WithState
 $tabRecent.Controls.Add($listRecent)
 
 $tabIncoming = New-Object System.Windows.Forms.TabPage
@@ -3244,12 +3962,6 @@ $tabIncoming.Text = "Incoming from GitHub"
 $commitTabs.TabPages.Add($tabIncoming)
 $listIncoming = New-CommitList
 $tabIncoming.Controls.Add($listIncoming)
-
-$tabOutgoing = New-Object System.Windows.Forms.TabPage
-$tabOutgoing.Text = "Not Pushed"
-$commitTabs.TabPages.Add($tabOutgoing)
-$listOutgoing = New-CommitList
-$tabOutgoing.Controls.Add($listOutgoing)
 
 # Collapsed last: SplitContainer needs its panels populated before it will
 # accept a collapse without complaining about minimum sizes.
@@ -3355,8 +4067,7 @@ $btnRefresh.Add_Click({ Refresh-Repository -Fetch })
 $btnBuild.Add_Click({ Run-GradleTask -Task "build" })
 $btnDeploy.Add_Click({ Run-GradleTask -Task "deploy" -Deploy })
 $btnPull.Add_Click({ Safe-Pull })
-$btnPush.Add_Click({ Push-Commits })
-$btnCommit.Add_Click({ Commit-All })
+$btnCommit.Add_Click({ Commit-AndPush })
 $btnBranch.Add_Click({ Switch-Branch })
 $btnRobot.Add_Click({ Check-RobotConnection })
 $btnProject.Add_Click({ Change-Project })
@@ -3375,6 +4086,12 @@ $btnCancel.Add_Click({
 
 $btnDiff.Add_Click({ Show-Changes })
 $btnDiffClose.Add_Click({ Show-DiffPanel $false })
+
+# Double-click any commit row to inspect it. $this is the list that was clicked,
+# so all three share one handler.
+foreach ($commitList in @($listRecent, $listIncoming)) {
+    $commitList.Add_DoubleClick({ Show-SelectedCommit -ListView $this })
+}
 $cmbDiffFile.Add_SelectedIndexChanged({
     # Ignore the events fired while the dropdown is being filled.
     if (-not $script:DiffPopulating) { Render-Diff }
