@@ -92,6 +92,32 @@ anything.
 Offline deploy is on by default, matching WPILib's own default, which is what you
 want at a competition with no internet.
 
+## Clearing an E-Stop
+
+An E-Stop stays latched until the robot program restarts. Redeploying clears it
+only because a deploy restarts the program as its last step. **Clear E-Stop**
+does just that step, without rebuilding, over SSH as the roboRIO's `admin`
+account. It pings the robot first, then offers two choices:
+
+| | Restart robot program | Reboot the roboRIO |
+| --- | --- | --- |
+| Time | About 5-15 seconds | About 30-60 seconds |
+| Clears the E-Stop | Yes, the same way a deploy does | Always |
+| Network | Stays connected | Drops until it has booted |
+| Also fixes | Nothing else | A stuck roboRIO, hung CAN, a wedged program |
+
+Start with the restart and reboot only if it is still stopped. Neither is a full
+power cycle: motor controllers and sensors keep power, so a fault in those needs
+the main breaker. The robot always comes back disabled; enable it from Driver
+Station.
+
+It uses the OpenSSH client built into Windows 10 and 11. If the roboRIO has had an
+admin password set, the login is refused and RCM says so. Driver Station's
+Diagnostics tab (Restart Robot Code / Restart roboRIO) does the same thing and is
+the fallback.
+
+Never use this to get around an E-Stop from the field or a referee.
+
 ## Staying up to date
 
 RCM checks GitHub for a newer release when it starts. The check runs in the

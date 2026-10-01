@@ -64,7 +64,7 @@ $script:AppLongName = "Robot Code Manager"
 # Must match the tag of the release this build ships as: the update check
 # compares this against the latest tag on GitHub. Build-Exe.ps1 prints it and
 # warns when it has fallen behind the newest local tag.
-$script:AppVersion = "1.1.0"
+$script:AppVersion = "1.2.0"
 $script:UpdateApiUrl = "https://api.github.com/repos/willfreyman/RobotCodeManager/releases/latest"
 $script:ReleasesUrl  = "https://github.com/willfreyman/RobotCodeManager/releases/latest"
 $script:AppTeam    = "Nightbots  -  FRC 10686"
@@ -1523,6 +1523,221 @@ function Check-RobotConnection {
                         "and this computer is on the robot network or plugged into the USB port.`r`n`r`n" +
                         "Deploy will almost certainly fail until this is fixed.")
         }
+    }
+    finally {
+        Set-Busy $false
+        Update-StateDisplay $script:RepoState
+    }
+}
+
+# ---------------- Clearing an E-Stop ----------------
+#
+# An E-Stop stays latched until the robot program restarts. Redeploying clears
+# it only because GradleRIO restarts the program as its last step, so these do
+# that step on its own, over SSH as the roboRIO's admin account (blank password).
+
+# What GradleRIO runs at the end of a deploy to start the new code.
+$script:RestartRobotCommand = "/usr/local/frc/bin/frcKillRobot.sh -t -r"
+# Detached with a short delay so ssh gets a clean exit code before the
+# connection drops, rather than a 255 that looks exactly like a failure.
+$script:RebootRioCommand = "sync; nohup sh -c 'sleep 1; /sbin/reboot' </dev/null >/dev/null 2>&1 &"
+
+function Resolve-SshPath {
+    $found = Get-Command "ssh.exe" -ErrorAction SilentlyContinue
+    if ($found) { return $found.Source }
+    # Windows' own OpenSSH client. Sysnative covers a 32-bit PowerShell, which
+    # cannot see the 64-bit System32 folder under its real name.
+    foreach ($dir in @("System32", "Sysnative")) {
+        $path = Join-Path $env:SystemRoot "$dir\OpenSSH\ssh.exe"
+        if (Test-Path -LiteralPath $path) { return $path }
+    }
+    return $null
+}
+
+function Get-SshArguments {
+    param([string]$Address, [string]$Command)
+    # BatchMode stops ssh prompting for anything, since there is no console to
+    # answer it. The roboRIO's host key changes on every reimage, so it is
+    # neither checked nor remembered.
+    return @(
+        "-o", "BatchMode=yes",
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=NUL",
+        "-o", "ConnectTimeout=5",
+        "-o", "LogLevel=ERROR",
+        "admin@$Address",
+        $Command
+    )
+}
+
+function Show-EStopDialog {
+    # Returns 'restart', 'reboot', or $null when cancelled.
+    param([string]$RobotAddress)
+
+    $dialog = New-Object System.Windows.Forms.Form
+    $dialog.Text = "Clear E-Stop"
+    $dialog.StartPosition = "CenterParent"
+    $dialog.FormBorderStyle = "FixedDialog"
+    $dialog.MaximizeBox = $false
+    $dialog.MinimizeBox = $false
+    $dialog.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $dialog.ClientSize = New-Object System.Drawing.Size(560, 402)
+    Set-DialogIcon $dialog
+
+    $intro = New-Object System.Windows.Forms.Label
+    $intro.Text = ("An E-Stop stays latched until the robot program restarts. Only clear it once " +
+                   "whatever caused it is fixed and everyone is clear of the robot.`r`n`r`n" +
+                   "Never use this to get around an E-Stop from the field or a referee.`r`n`r`n" +
+                   "Robot: $RobotAddress")
+    $intro.Location = New-Object System.Drawing.Point(14, 12)
+    $intro.Size = New-Object System.Drawing.Size(532, 84)
+    $dialog.Controls.Add($intro)
+
+    $optRestart = New-Object System.Windows.Forms.RadioButton
+    $optRestart.Text = "Restart robot program  (recommended, about 5-15 seconds)"
+    $optRestart.Font = New-Object System.Drawing.Font("Segoe UI Semibold", 9)
+    $optRestart.Checked = $true
+    $optRestart.Location = New-Object System.Drawing.Point(16, 102)
+    $optRestart.Size = New-Object System.Drawing.Size(530, 22)
+    $dialog.Controls.Add($optRestart)
+
+    $restartText = New-Object System.Windows.Forms.Label
+    $restartText.Text = ("The same restart a deploy does at the end, without rebuilding anything. " +
+                         "The robot keeps its network connection, so Driver Station reconnects fast.`r`n" +
+                         "Will not fix a stuck roboRIO, a crashed CAN bus, or a hung radio link.")
+    $restartText.ForeColor = $script:ColMuted
+    $restartText.Location = New-Object System.Drawing.Point(34, 126)
+    $restartText.Size = New-Object System.Drawing.Size(512, 64)
+    $dialog.Controls.Add($restartText)
+
+    $optReboot = New-Object System.Windows.Forms.RadioButton
+    $optReboot.Text = "Reboot the roboRIO  (about 30-60 seconds)"
+    $optReboot.Font = New-Object System.Drawing.Font("Segoe UI Semibold", 9)
+    $optReboot.Location = New-Object System.Drawing.Point(16, 196)
+    $optReboot.Size = New-Object System.Drawing.Size(530, 22)
+    $dialog.Controls.Add($optReboot)
+
+    $rebootText = New-Object System.Windows.Forms.Label
+    $rebootText.Text = ("Restarts the whole controller, the same as Driver Station's Restart roboRIO. " +
+                        "Always clears an E-Stop and resets everything else too.`r`n" +
+                        "Slower, and the robot drops off the network until it has booted. Motor " +
+                        "controllers and sensors keep power, so this is not a full power cycle.")
+    $rebootText.ForeColor = $script:ColMuted
+    $rebootText.Location = New-Object System.Drawing.Point(34, 220)
+    $rebootText.Size = New-Object System.Drawing.Size(512, 80)
+    $dialog.Controls.Add($rebootText)
+
+    $after = New-Object System.Windows.Forms.Label
+    $after.Text = ("Either way, the robot comes back disabled. Enable it from Driver Station " +
+                   "when it shows communications and robot code green again.")
+    $after.Location = New-Object System.Drawing.Point(14, 310)
+    $after.Size = New-Object System.Drawing.Size(532, 40)
+    $dialog.Controls.Add($after)
+
+    $ok = New-Object System.Windows.Forms.Button
+    $ok.Text = "Clear E-Stop"
+    $ok.DialogResult = [System.Windows.Forms.DialogResult]::OK
+    $ok.Size = New-Object System.Drawing.Size(110, 28)
+    $ok.Location = New-Object System.Drawing.Point(334, 362)
+    $dialog.Controls.Add($ok)
+
+    $cancel = New-Object System.Windows.Forms.Button
+    $cancel.Text = "Cancel"
+    $cancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $cancel.Size = New-Object System.Drawing.Size(96, 28)
+    $cancel.Location = New-Object System.Drawing.Point(450, 362)
+    $dialog.Controls.Add($cancel)
+
+    # Cancel is the default, as with the other warning prompts: Enter should
+    # never be what restarts a robot.
+    $dialog.AcceptButton = $cancel
+    $dialog.CancelButton = $cancel
+
+    try {
+        if ($dialog.ShowDialog($form) -ne [System.Windows.Forms.DialogResult]::OK) { return $null }
+        if ($optReboot.Checked) { return 'reboot' }
+        return 'restart'
+    }
+    finally {
+        $dialog.Dispose()
+    }
+}
+
+function Clear-EStop {
+    if ($script:IsBusy) { return }
+    if (-not $script:TeamNumber) {
+        Show-Error "No team number is configured, so the robot address cannot be worked out."
+        return
+    }
+
+    $ssh = Resolve-SshPath
+    if (-not $ssh) {
+        Show-Error ("ssh.exe was not found, so RCM cannot reach the roboRIO.`r`n`r`n" +
+                    "Turn on Windows' OpenSSH Client (Settings > System > Optional features), " +
+                    "or use Restart Robot Code on Driver Station's Diagnostics tab instead.")
+        return
+    }
+
+    Set-Busy $true "Looking for the robot..."
+    try { $robot = Find-Robot } finally { Set-Busy $false }
+
+    if (-not $robot) {
+        Show-Error ("The roboRIO did not answer on any known address, so the E-Stop cannot be " +
+                    "cleared from here.`r`n`r`nIf the robot is on, power-cycle it with the main breaker.")
+        Update-StateDisplay $script:RepoState
+        return
+    }
+
+    $mode = Show-EStopDialog -RobotAddress "$($robot.Address)  ($($robot.Label))"
+    if ($null -eq $mode) {
+        Append-Log "`r`nClear E-Stop cancelled.`r`n"
+        Update-StateDisplay $script:RepoState
+        return
+    }
+
+    $command = if ($mode -eq 'reboot') { $script:RebootRioCommand } else { $script:RestartRobotCommand }
+    $label = if ($mode -eq 'reboot') { "Rebooting the roboRIO..." } else { "Restarting the robot program..." }
+
+    Set-Busy $true $label
+    try {
+        Append-Log "`r`n$label`r`n"
+        $result = Invoke-Process -FilePath $ssh -Arguments (Get-SshArguments $robot.Address $command) `
+                                 -AllowFailure -Cancellable -TimeoutSeconds 30
+        Write-RunLog -Task "estop-$mode" -Result $result | Out-Null
+
+        if ($result.Cancelled) {
+            Append-Log "`r`nClear E-Stop was cancelled.`r`n"
+        }
+        elseif ($result.ExitCode -eq 0) {
+            $message = if ($mode -eq 'reboot') {
+                ("The roboRIO is rebooting. It will drop off the network for about 30-60 seconds.`r`n`r`n" +
+                 "Enable from Driver Station once communications and robot code are green.")
+            } else {
+                ("The robot program is restarting. Driver Station will show No Robot Code for a " +
+                 "few seconds.`r`n`r`nEnable once robot code is green. If it still says " +
+                 "Emergency Stopped, run this again and choose Reboot the roboRIO.")
+            }
+            Append-Log "`r`nSUCCESS: E-Stop clear requested ($mode).`r`n"
+            Show-Info $message "E-Stop"
+        }
+        else {
+            $text = $result.StdOut + "`n" + $result.StdErr
+            $hint = if ($result.TimedOut) {
+                "The roboRIO stopped responding partway through."
+            } elseif ($text -match 'Permission denied|Authentication failed|Too many authentication') {
+                ("The roboRIO refused the admin login. Someone may have set an admin password on it, " +
+                 "which RCM cannot type.")
+            } else {
+                "RCM could not open an SSH connection to the roboRIO."
+            }
+            Append-Log "`r`nFAILED: $hint`r`n"
+            Show-Error ("$hint`r`n`r`nUse Restart Robot Code (or Restart roboRIO) on Driver " +
+                        "Station's Diagnostics tab instead, or power-cycle the robot.")
+        }
+    }
+    catch {
+        Append-Log "`r`nERROR: $($_.Exception.Message)`r`n"
+        Show-Error $_.Exception.Message
     }
     finally {
         Set-Busy $false
@@ -3633,6 +3848,7 @@ $btnBuild    = New-ActionButton "Build Robot Code" 128
 $btnDeploy   = New-ActionButton "Deploy Robot Code" 136
 $btnCancel   = New-ActionButton "Cancel" 76
 $btnRobot    = New-ActionButton "Check Robot" 100
+$btnEStop    = New-ActionButton "Clear E-Stop" 100
 $btnCommit   = New-ActionButton "Commit & Push" 116
 $btnBranch   = New-ActionButton "Switch Branch" 106
 $btnPull     = New-ActionButton "Pull Safely" 92
@@ -3649,7 +3865,7 @@ Set-AccentButton $btnCancel $script:ColDanger
 $btnCancel.Enabled = $false
 
 # Cancel is deliberately excluded: it must stay usable while an operation runs.
-$actionButtons = @($btnRefresh, $btnBuild, $btnDeploy, $btnRobot, $btnCommit, $btnBranch, $btnPull,
+$actionButtons = @($btnRefresh, $btnBuild, $btnDeploy, $btnRobot, $btnEStop, $btnCommit, $btnBranch, $btnPull,
                    $btnDiff, $btnProject, $btnVSCode, $btnFolder, $btnStopG, $btnUpdate)
 
 # Polls the in-flight update request. Started only while a check is running.
@@ -4039,6 +4255,11 @@ function Update-CommandPreview {
             $lines.Add("")
             $lines.Add("  If that team number is wrong, fix it in VS Code with")
             $lines.Add("  'WPILib: Set Team Number', or edit wpilib_preferences.json.")
+            $lines.Add("")
+            $lines.Add("CLEAR E-STOP")
+            $lines.Add("  ssh admin@<first address above that answers a ping>, then one of:")
+            $lines.Add("    restart program : $($script:RestartRobotCommand)")
+            $lines.Add("    reboot roboRIO  : $($script:RebootRioCommand)")
         } else {
             $lines.Add("  WARNING: no team number was found, so -PteamNumber is not being")
             $lines.Add("  passed. Set it in VS Code with 'WPILib: Set Team Number'.")
@@ -4070,6 +4291,7 @@ $btnPull.Add_Click({ Safe-Pull })
 $btnCommit.Add_Click({ Commit-AndPush })
 $btnBranch.Add_Click({ Switch-Branch })
 $btnRobot.Add_Click({ Check-RobotConnection })
+$btnEStop.Add_Click({ Clear-EStop })
 $btnProject.Add_Click({ Change-Project })
 $btnVSCode.Add_Click({ Open-VSCode })
 $btnStopG.Add_Click({ Stop-GradleDaemons })
